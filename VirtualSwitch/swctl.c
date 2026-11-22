@@ -129,6 +129,11 @@ int main(int argc, char *argv[])
         printf("./swctl show mac\n");
         printf("./swctl show ports\n");
         printf("./swctl clear mac\n");
+        printf("./swctl shutdown <port>\n");
+        printf("./swctl up <port>\n");
+        printf("./swctl vlan <port> <vlan>\n");
+        printf("./swctl trunk <port>\n");
+        printf("./swctl mirror <source> <target>\n");
         printf("./swctl stats --watch\n");
 
         return 1;

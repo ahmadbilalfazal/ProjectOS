@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <sys/time.h>
+#include <stdarg.h>
 
 #include "shm_stats.h"
 #include "frame.h"
@@ -25,15 +26,47 @@
 #define MAC_BUCKETS 16
 #define MAC_TABLE_SIZE 256
 #define BUFFER_SIZE 512
+#define QUEUE_LIMIT 128
+#define TOKEN_RATE 1048576.0
+#define TOKEN_BURST 65536.0
+#define MAC_AGE_SECONDS 60
+#define MACS_PER_PORT 16
 
 #define MAX_FRAME_SIZE (FRAME_HEADER_SIZE + MAX_PAYLOAD_SIZE)
+
+typedef struct frame_blob {
+    atomic_int references;
+    size_t length;
+    unsigned char data[MAX_FRAME_SIZE];
+} frame_blob_t;
+
+typedef struct queue_node {
+    frame_blob_t *frame;
+    struct timespec queued_at;
+    struct queue_node *next;
+} queue_node_t;
 
 typedef struct {
     int fd;
     int port;
     pthread_t thread;
+    pthread_t sender_thread;
     bool active;
+    bool administratively_up;
+    int vlan;
+    bool trunk;
+    int mirror_port;
     pthread_mutex_t mutex;
+    pthread_mutex_t queue_mutex;
+    pthread_mutex_t token_mutex;
+    pthread_cond_t queue_cond;
+    queue_node_t *head[3];
+    queue_node_t *tail[3];
+    int queue_count;
+    int rr_index;
+    int rr_used[3];
+    double tokens;
+    struct timespec token_time;
 } switch_port_t;
 
 static switch_port_t switch_ports[MAX_PORTS];
@@ -55,6 +88,16 @@ typedef struct {
 } mac_bucket_t;
 
 static mac_bucket_t mac_table[MAC_BUCKETS];
+static pthread_mutex_t mac_manage_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int mac_entry_count = 0;
+static pthread_t aging_thread;
+static pthread_t timer_thread;
+static pthread_t logger_thread;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t log_cond = PTHREAD_COND_INITIALIZER;
+static char log_queue[128][256];
+static int log_head = 0, log_tail = 0, log_count = 0;
+static bool logger_stopping = false;
 
 static shm_stats_t *shared_stats;
 static int shm_fd = -1;
@@ -70,6 +113,65 @@ static int running_ports;
 static pthread_mutex_t handler_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t handler_cond = PTHREAD_COND_INITIALIZER;
 static int active_handlers = 0;
+
+
+static void log_message(const char *format, ...)
+{
+    char message[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    pthread_mutex_lock(&log_mutex);
+    if (log_count < 128) {
+        snprintf(log_queue[log_tail], sizeof(log_queue[log_tail]), "%s", message);
+        log_tail = (log_tail + 1) % 128;
+        log_count++;
+        pthread_cond_signal(&log_cond);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+static void *logger_worker(void *arg)
+{
+    (void)arg;
+    FILE *file = fopen("switch.log", "a");
+    if (file == NULL) return NULL;
+    for (;;) {
+        pthread_mutex_lock(&log_mutex);
+        while (log_count == 0 && !logger_stopping)
+            pthread_cond_wait(&log_cond, &log_mutex);
+        if (log_count == 0 && logger_stopping) {
+            pthread_mutex_unlock(&log_mutex);
+            break;
+        }
+        char message[256];
+        snprintf(message, sizeof(message), "%s", log_queue[log_head]);
+        log_head = (log_head + 1) % 128;
+        log_count--;
+        pthread_mutex_unlock(&log_mutex);
+        time_t now = time(NULL);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        char stamp[32];
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_now);
+        fprintf(file, "[%s] %s\n", stamp, message);
+        fflush(file);
+    }
+    fclose(file);
+    return NULL;
+}
+
+static void logger_stop(void)
+{
+    pthread_mutex_lock(&log_mutex);
+    logger_stopping = true;
+    pthread_cond_broadcast(&log_cond);
+    pthread_mutex_unlock(&log_mutex);
+    pthread_join(logger_thread, NULL);
+    pthread_cond_destroy(&log_cond);
+    pthread_mutex_destroy(&log_mutex);
+}
 
 unsigned int mac_hash(const unsigned char *mac)
 {
@@ -120,6 +222,7 @@ void mac_table_init(void)
 
 void mac_table_clear(void)
 {
+    pthread_mutex_lock(&mac_manage_mutex);
     for (int i = 0; i < MAC_BUCKETS; i++) {
         pthread_mutex_lock(&mac_table[i].mutex);
     }
@@ -139,6 +242,8 @@ void mac_table_clear(void)
     for (int i = MAC_BUCKETS - 1; i >= 0; i--) {
         pthread_mutex_unlock(&mac_table[i].mutex);
     }
+    mac_entry_count = 0;
+    pthread_mutex_unlock(&mac_manage_mutex);
 }
 
 void mac_table_destroy(void)
@@ -202,41 +307,105 @@ void mac_table_show(int client_fd)
 int mac_table_learn(const unsigned char *mac, int port)
 {
     unsigned int bucket = mac_hash(mac);
-
+    pthread_mutex_lock(&mac_manage_mutex);
     pthread_mutex_lock(&mac_table[bucket].mutex);
-
     mac_entry_t *entry = mac_table[bucket].head;
-
     while (entry != NULL) {
         if (memcmp(entry->mac, mac, 6) == 0) {
+            if (entry->port != port) log_message("MAC moved: port %d -> port %d", entry->port, port);
             entry->port = port;
             entry->updated = time(NULL);
-
             pthread_mutex_unlock(&mac_table[bucket].mutex);
+            pthread_mutex_unlock(&mac_manage_mutex);
             return 0;
         }
-
         entry = entry->next;
+    }
+    pthread_mutex_unlock(&mac_table[bucket].mutex);
+
+    int on_port = 0;
+    for (int i = 0; i < MAC_BUCKETS; i++) {
+        pthread_mutex_lock(&mac_table[i].mutex);
+        for (entry = mac_table[i].head; entry != NULL; entry = entry->next)
+            if (entry->port == port) on_port++;
+        pthread_mutex_unlock(&mac_table[i].mutex);
+    }
+    if (on_port >= MACS_PER_PORT) {
+        pthread_mutex_unlock(&mac_manage_mutex);
+        return -2;
+    }
+
+    if (mac_entry_count >= MAC_TABLE_SIZE) {
+        time_t oldest_time = 0;
+        unsigned int oldest_bucket = 0;
+        unsigned char oldest_mac[6] = {0};
+        for (int i = 0; i < MAC_BUCKETS; i++) {
+            pthread_mutex_lock(&mac_table[i].mutex);
+            for (entry = mac_table[i].head; entry != NULL; entry = entry->next) {
+                if (oldest_time == 0 || entry->updated < oldest_time) {
+                    oldest_time = entry->updated;
+                    oldest_bucket = (unsigned int)i;
+                    memcpy(oldest_mac, entry->mac, 6);
+                }
+            }
+            pthread_mutex_unlock(&mac_table[i].mutex);
+        }
+        pthread_mutex_lock(&mac_table[oldest_bucket].mutex);
+        mac_entry_t **link = &mac_table[oldest_bucket].head;
+        while (*link != NULL) {
+            if (memcmp((*link)->mac, oldest_mac, 6) == 0) {
+                mac_entry_t *old = *link;
+                *link = old->next;
+                free(old);
+                mac_entry_count--;
+                break;
+            }
+            link = &(*link)->next;
+        }
+        pthread_mutex_unlock(&mac_table[oldest_bucket].mutex);
     }
 
     entry = malloc(sizeof(mac_entry_t));
-
     if (entry == NULL) {
-        pthread_mutex_unlock(&mac_table[bucket].mutex);
+        pthread_mutex_unlock(&mac_manage_mutex);
         return -1;
     }
-
     memcpy(entry->mac, mac, 6);
-
     entry->port = port;
     entry->updated = time(NULL);
-
+    pthread_mutex_lock(&mac_table[bucket].mutex);
     entry->next = mac_table[bucket].head;
     mac_table[bucket].head = entry;
-
     pthread_mutex_unlock(&mac_table[bucket].mutex);
-
+    mac_entry_count++;
+    pthread_mutex_unlock(&mac_manage_mutex);
     return 0;
+}
+
+static void *mac_aging_thread(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&shutting_down)) {
+        sleep(5);
+        if (atomic_load(&shutting_down)) break;
+        time_t now = time(NULL);
+        pthread_mutex_lock(&mac_manage_mutex);
+        for (int i = 0; i < MAC_BUCKETS; i++) {
+            pthread_mutex_lock(&mac_table[i].mutex);
+            mac_entry_t **link = &mac_table[i].head;
+            while (*link != NULL) {
+                mac_entry_t *entry = *link;
+                if (now - entry->updated > MAC_AGE_SECONDS) {
+                    *link = entry->next;
+                    free(entry);
+                    mac_entry_count--;
+                } else link = &entry->next;
+            }
+            pthread_mutex_unlock(&mac_table[i].mutex);
+        }
+        pthread_mutex_unlock(&mac_manage_mutex);
+    }
+    return NULL;
 }
 
 int mac_table_lookup(const unsigned char *mac, int *port)
@@ -261,62 +430,175 @@ int mac_table_lookup(const unsigned char *mac, int *port)
     return 0;
 }
 
-void forward_frame(int source_port, const unsigned char *frame, size_t length,
-                   const unsigned char *destination)
+static void frame_release(frame_blob_t *frame)
 {
+    if (atomic_fetch_sub(&frame->references, 1) == 1) free(frame);
+}
+
+static int enqueue_frame(int target, frame_blob_t *frame, int priority)
+{
+    switch_port_t *port = &switch_ports[target];
+    queue_node_t *node = malloc(sizeof(*node));
+    if (node == NULL) return -1;
+    node->frame = frame;
+    clock_gettime(CLOCK_MONOTONIC, &node->queued_at);
+    node->next = NULL;
+
+    pthread_mutex_lock(&port->queue_mutex);
+    if (port->queue_count >= QUEUE_LIMIT || !port->administratively_up) {
+        pthread_mutex_unlock(&port->queue_mutex);
+        free(node);
+        return -1;
+    }
+    atomic_fetch_add(&frame->references, 1);
+    if (port->tail[priority] != NULL) port->tail[priority]->next = node;
+    else port->head[priority] = node;
+    port->tail[priority] = node;
+    port->queue_count++;
+    pthread_cond_signal(&port->queue_cond);
+    pthread_mutex_unlock(&port->queue_mutex);
+    return 0;
+}
+
+static queue_node_t *dequeue_frame(switch_port_t *port)
+{
+    static const int weights[3] = {5, 3, 1};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (int priority = 2; priority >= 1; priority--) {
+        if (port->head[priority] != NULL) {
+            double age = (double)(now.tv_sec - port->head[priority]->queued_at.tv_sec) +
+                         (double)(now.tv_nsec - port->head[priority]->queued_at.tv_nsec) / 1000000000.0;
+            if (age >= 2.0) {
+                queue_node_t *aged = port->head[priority];
+                port->head[priority] = aged->next;
+                if (port->head[priority] == NULL) port->tail[priority] = NULL;
+                port->queue_count--;
+                return aged;
+            }
+        }
+    }
+    for (int tries = 0; tries < 9; tries++) {
+        int priority = port->rr_index;
+        if (port->head[priority] != NULL) {
+            queue_node_t *node = port->head[priority];
+            port->head[priority] = node->next;
+            if (port->head[priority] == NULL) port->tail[priority] = NULL;
+            port->queue_count--;
+            port->rr_used[priority]++;
+            if (port->rr_used[priority] >= weights[priority] || port->head[priority] == NULL) {
+                port->rr_used[priority] = 0;
+                port->rr_index = (priority + 1) % 3;
+            }
+            return node;
+        }
+        port->rr_index = (port->rr_index + 1) % 3;
+    }
+    return NULL;
+}
+
+static void *token_timer_thread(void *arg)
+{
+    (void)arg;
+    const struct timespec interval = {0, 100000000L};
+    while (!atomic_load(&shutting_down)) {
+        nanosleep(&interval, NULL);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        for (int i = 0; i < running_ports; i++) {
+            switch_port_t *port = &switch_ports[i];
+            pthread_mutex_lock(&port->token_mutex);
+            double elapsed = (double)(now.tv_sec - port->token_time.tv_sec) +
+                             (double)(now.tv_nsec - port->token_time.tv_nsec) / 1000000000.0;
+            if (elapsed > 0) {
+                port->tokens += elapsed * TOKEN_RATE;
+                if (port->tokens > TOKEN_BURST) port->tokens = TOKEN_BURST;
+                port->token_time = now;
+            }
+            pthread_mutex_unlock(&port->token_mutex);
+            pthread_mutex_lock(&port->queue_mutex);
+            pthread_cond_signal(&port->queue_cond);
+            pthread_mutex_unlock(&port->queue_mutex);
+        }
+    }
+    return NULL;
+}
+
+static void *port_sender(void *arg)
+{
+    switch_port_t *port = arg;
+    while (!atomic_load(&shutting_down)) {
+        pthread_mutex_lock(&port->queue_mutex);
+        while (port->queue_count == 0 && !atomic_load(&shutting_down))
+            pthread_cond_wait(&port->queue_cond, &port->queue_mutex);
+        queue_node_t *node = dequeue_frame(port);
+        pthread_mutex_unlock(&port->queue_mutex);
+        if (node == NULL) continue;
+
+        while (!atomic_load(&shutting_down)) {
+            pthread_mutex_lock(&port->token_mutex);
+            bool has_tokens = port->tokens >= (double)node->frame->length;
+            if (has_tokens) port->tokens -= (double)node->frame->length;
+            pthread_mutex_unlock(&port->token_mutex);
+            if (has_tokens) break;
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_nsec += 200000000L;
+            if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+            pthread_mutex_lock(&port->queue_mutex);
+            pthread_cond_timedwait(&port->queue_cond, &port->queue_mutex, &until);
+            pthread_mutex_unlock(&port->queue_mutex);
+        }
+
+        pthread_mutex_lock(&port->mutex);
+        int fd = port->active ? port->fd : -1;
+        int sent = fd >= 0 ? net_send_all(fd, node->frame->data, node->frame->length) : -1;
+        pthread_mutex_unlock(&port->mutex);
+        pthread_mutex_lock(&shared_stats->mutex);
+        if (sent == 0) shared_stats->ports[port->port].frames_out++;
+        else shared_stats->ports[port->port].frames_dropped++;
+        pthread_mutex_unlock(&shared_stats->mutex);
+        frame_release(node->frame);
+        free(node);
+    }
+    return NULL;
+}
+
+void forward_frame(int source_port, const unsigned char *frame, size_t length,
+                   const unsigned char *destination, int vlan, int priority)
+{
+    frame_blob_t *shared = malloc(sizeof(*shared));
+    if (shared == NULL) return;
+    atomic_init(&shared->references, 1);
+    shared->length = length;
+    memcpy(shared->data, frame, length);
+
     int target_port = -1;
-
-    if (mac_table_lookup(destination, &target_port) == 1) {
-        if (target_port == source_port || target_port < 0 ||
-            target_port >= running_ports) {
-            return;
-        }
-
-        switch_port_t *port = &switch_ports[target_port];
-
-        pthread_mutex_lock(&port->mutex);
-
-        if (port->active && port->fd >= 0) {
-            if (net_send_all(port->fd, frame, length) == 0) {
-                pthread_mutex_lock(&shared_stats->mutex);
-                shared_stats->ports[target_port].frames_out++;
-                pthread_mutex_unlock(&shared_stats->mutex);
-            }
-            else {
-                pthread_mutex_lock(&shared_stats->mutex);
-                shared_stats->ports[target_port].frames_dropped++;
-                pthread_mutex_unlock(&shared_stats->mutex);
-            }
-        }
-
-        pthread_mutex_unlock(&port->mutex);
-        return;
-    }
-
+    int known = mac_table_lookup(destination, &target_port);
+    pthread_mutex_lock(&switch_ports[source_port].mutex);
+    int mirror = switch_ports[source_port].mirror_port;
+    pthread_mutex_unlock(&switch_ports[source_port].mutex);
     for (int i = 0; i < running_ports; i++) {
-        if (i == source_port) {
-            continue;
+        if (i == source_port) continue;
+        if (known && i != target_port) continue;
+        pthread_mutex_lock(&switch_ports[i].mutex);
+        bool vlan_allowed = switch_ports[i].trunk || switch_ports[i].vlan == vlan;
+        pthread_mutex_unlock(&switch_ports[i].mutex);
+        if (!vlan_allowed) continue;
+        if (enqueue_frame(i, shared, priority) == -1) {
+            pthread_mutex_lock(&shared_stats->mutex);
+            shared_stats->ports[i].frames_dropped++;
+            pthread_mutex_unlock(&shared_stats->mutex);
         }
-
-        switch_port_t *port = &switch_ports[i];
-
-        pthread_mutex_lock(&port->mutex);
-
-        if (port->active && port->fd >= 0) {
-            if (net_send_all(port->fd, frame, length) == 0) {
-                pthread_mutex_lock(&shared_stats->mutex);
-                shared_stats->ports[i].frames_out++;
-                pthread_mutex_unlock(&shared_stats->mutex);
-            }
-            else {
-                pthread_mutex_lock(&shared_stats->mutex);
-                shared_stats->ports[i].frames_dropped++;
-                pthread_mutex_unlock(&shared_stats->mutex);
-            }
-        }
-
-        pthread_mutex_unlock(&port->mutex);
     }
+    if (mirror >= 0 && mirror < running_ports && mirror != source_port && mirror != target_port) {
+        if (enqueue_frame(mirror, shared, priority) == 0) {
+            pthread_mutex_lock(&shared_stats->mutex);
+            shared_stats->ports[mirror].frames_mirrored++;
+            pthread_mutex_unlock(&shared_stats->mutex);
+        }
+    }
+    frame_release(shared);
 }
 
 void *host_handler(void *arg)
@@ -352,13 +634,29 @@ void *host_handler(void *arg)
 
         size_t frame_length = FRAME_HEADER_SIZE + header.length;
 
-        mac_table_learn(header.src, port->port);
+        pthread_mutex_lock(&port->mutex);
+        bool vlan_allowed = port->trunk || header.vlan == port->vlan;
+        pthread_mutex_unlock(&port->mutex);
+        if (!vlan_allowed) {
+            pthread_mutex_lock(&shared_stats->mutex);
+            shared_stats->ports[port->port].frames_dropped++;
+            pthread_mutex_unlock(&shared_stats->mutex);
+            continue;
+        }
+        int learn_result = mac_table_learn(header.src, port->port);
+        if (learn_result == -2) {
+            log_message("Port security limit exceeded on port %d; shutting port down", port->port);
+            pthread_mutex_lock(&port->queue_mutex);
+            port->administratively_up = false;
+            pthread_mutex_unlock(&port->queue_mutex);
+            break;
+        }
 
         pthread_mutex_lock(&shared_stats->mutex);
         shared_stats->ports[port->port].frames_in++;
         pthread_mutex_unlock(&shared_stats->mutex);
 
-        forward_frame(port->port, frame, frame_length, header.dst);
+        forward_frame(port->port, frame, frame_length, header.dst, header.vlan, header.priority);
     }
 
     pthread_mutex_lock(&port->mutex);
@@ -373,7 +671,7 @@ void *host_handler(void *arg)
     close(fd);
     sem_post(&free_ports);
 
-    printf("Host disconnected from port %d\n", port->port);
+    log_message("Host disconnected from port %d", port->port);
 
     pthread_mutex_lock(&handler_mutex);
     active_handlers--;
@@ -498,7 +796,7 @@ void *tcp_listener(void *arg)
 
         pthread_detach(port->thread);
 
-        printf("Host connected on port %d\n", assigned_port);
+        log_message("Host connected on port %d", assigned_port);
     }
 
     return NULL;
@@ -532,6 +830,50 @@ void handle_command(int client_fd, char *command)
         }
 
         pthread_mutex_unlock(&shared_stats->mutex);
+    }
+    else if (strncmp(command, "shutdown ", 9) == 0 || strncmp(command, "up ", 3) == 0) {
+        int port_number = atoi(command + (command[0] == 'u' ? 3 : 9));
+        if (port_number < 0 || port_number >= running_ports) { send(client_fd, "Invalid port\n", 13, MSG_NOSIGNAL); return; }
+        switch_port_t *port = &switch_ports[port_number];
+        pthread_mutex_lock(&port->queue_mutex);
+        port->administratively_up = command[0] == 'u';
+        if (!port->administratively_up) {
+            for (int q = 0; q < 3; q++) {
+                queue_node_t *node = port->head[q];
+                while (node != NULL) { queue_node_t *next = node->next; frame_release(node->frame); free(node); node = next; }
+                port->head[q] = port->tail[q] = NULL;
+            }
+            port->queue_count = 0;
+        }
+        pthread_cond_broadcast(&port->queue_cond);
+        pthread_mutex_unlock(&port->queue_mutex);
+        if (!port->administratively_up) { pthread_mutex_lock(&port->mutex); if (port->fd >= 0) shutdown(port->fd, SHUT_RDWR); pthread_mutex_unlock(&port->mutex); }
+        send(client_fd, "Port updated\n", 13, MSG_NOSIGNAL);
+    }
+    else if (strncmp(command, "vlan ", 5) == 0) {
+        int port_number = -1, vlan = -1;
+        if (sscanf(command + 5, "%d %d", &port_number, &vlan) != 2 || port_number < 0 || port_number >= running_ports || vlan < 1 || vlan > 4094) { send(client_fd, "Usage: vlan <port> <1-4094>\n", 29, MSG_NOSIGNAL); return; }
+        pthread_mutex_lock(&switch_ports[port_number].mutex);
+        switch_ports[port_number].vlan = vlan;
+        switch_ports[port_number].trunk = false;
+        pthread_mutex_unlock(&switch_ports[port_number].mutex);
+        send(client_fd, "VLAN updated\n", 13, MSG_NOSIGNAL);
+    }
+    else if (strncmp(command, "trunk ", 6) == 0) {
+        int port_number = atoi(command + 6);
+        if (port_number < 0 || port_number >= running_ports) { send(client_fd, "Invalid port\n", 13, MSG_NOSIGNAL); return; }
+        pthread_mutex_lock(&switch_ports[port_number].mutex);
+        switch_ports[port_number].trunk = true;
+        pthread_mutex_unlock(&switch_ports[port_number].mutex);
+        send(client_fd, "Trunk enabled\n", strlen("Trunk enabled\n"), MSG_NOSIGNAL);
+    }
+    else if (strncmp(command, "mirror ", 7) == 0) {
+        int source = -1, target = -1;
+        if (sscanf(command + 7, "%d %d", &source, &target) != 2 || source < 0 || target < 0 || source >= running_ports || target >= running_ports || source == target) { send(client_fd, "Usage: mirror <source> <target>\n", 33, MSG_NOSIGNAL); return; }
+        pthread_mutex_lock(&switch_ports[source].mutex);
+        switch_ports[source].mirror_port = target;
+        pthread_mutex_unlock(&switch_ports[source].mutex);
+        send(client_fd, "Mirror configured\n", strlen("Mirror configured\n"), MSG_NOSIGNAL);
     }
     else if (strcmp(command, "clear mac") == 0) {
         mac_table_clear();
@@ -661,9 +1003,30 @@ void *signal_handler_thread(void *arg)
             }
         }
         else if (signal_number == SIGHUP) {
-            printf("SIGHUP received; no configuration file configured\n");
+            FILE *config = fopen("vswitch.conf", "r");
+            if (config == NULL) {
+                printf("SIGHUP: vswitch.conf not found\n");
+            } else {
+                char line[128];
+                while (fgets(line, sizeof(line), config) != NULL) {
+                    int port_number = -1, vlan = 1;
+                    char mode[32];
+                    int fields = sscanf(line, "%d %31s %d", &port_number, mode, &vlan);
+                    if (fields < 2 || port_number < 0 || port_number >= running_ports) continue;
+                    pthread_mutex_lock(&switch_ports[port_number].mutex);
+                    if (strcmp(mode, "trunk") == 0) switch_ports[port_number].trunk = true;
+                    else if (strcmp(mode, "access") == 0 && fields == 3 && vlan >= 1 && vlan <= 4094) {
+                        switch_ports[port_number].trunk = false;
+                        switch_ports[port_number].vlan = vlan;
+                    }
+                    pthread_mutex_unlock(&switch_ports[port_number].mutex);
+                }
+                fclose(config);
+                printf("SIGHUP: configuration reloaded\n");
+            }
         }
         else if (signal_number == SIGINT) {
+            log_message("SIGINT received; shutting down");
             printf("SIGINT received; shutting down\n");
 
             atomic_store(&shutting_down, true);
@@ -699,7 +1062,16 @@ int main(int argc, char *argv[])
         switch_ports[i].fd = -1;
         switch_ports[i].port = i;
         switch_ports[i].active = false;
+        switch_ports[i].administratively_up = true;
+        switch_ports[i].vlan = 1;
+        switch_ports[i].trunk = false;
+        switch_ports[i].mirror_port = -1;
+        switch_ports[i].tokens = TOKEN_BURST;
+        clock_gettime(CLOCK_MONOTONIC, &switch_ports[i].token_time);
         pthread_mutex_init(&switch_ports[i].mutex, NULL);
+        pthread_mutex_init(&switch_ports[i].queue_mutex, NULL);
+        pthread_mutex_init(&switch_ports[i].token_mutex, NULL);
+        pthread_cond_init(&switch_ports[i].queue_cond, NULL);
     }
 
     if (sem_init(&free_ports, 0, running_ports) == -1) {
@@ -764,7 +1136,6 @@ int main(int argc, char *argv[])
     }
 
     mac_table_init();
-
     if (shm_stats_create(&shared_stats, &shm_fd, running_ports) == -1) {
         mac_table_destroy();
         return 1;
@@ -806,6 +1177,57 @@ int main(int argc, char *argv[])
         shm_stats_destroy(shared_stats, shm_fd);
         mac_table_destroy();
         return 1;
+    }
+
+    if (pthread_create(&logger_thread, NULL, logger_worker, NULL) != 0) {
+        fprintf(stderr, "Failed to start logger thread\n");
+        close(server_fd);
+        unlink(SOCKET_PATH);
+        shm_stats_destroy(shared_stats, shm_fd);
+        mac_table_destroy();
+        return 1;
+    }
+    if (pthread_create(&aging_thread, NULL, mac_aging_thread, NULL) != 0) {
+        fprintf(stderr, "Failed to start MAC aging thread\n");
+        logger_stop();
+        close(server_fd);
+        unlink(SOCKET_PATH);
+        shm_stats_destroy(shared_stats, shm_fd);
+        mac_table_destroy();
+        return 1;
+    }
+    if (pthread_create(&timer_thread, NULL, token_timer_thread, NULL) != 0) {
+        fprintf(stderr, "Failed to start token timer thread\n");
+        atomic_store(&shutting_down, true);
+        pthread_join(aging_thread, NULL);
+        log_message("Startup failed");
+        logger_stop();
+        close(server_fd);
+        unlink(SOCKET_PATH);
+        shm_stats_destroy(shared_stats, shm_fd);
+        mac_table_destroy();
+        return 1;
+    }
+    for (int i = 0; i < running_ports; i++) {
+        if (pthread_create(&switch_ports[i].sender_thread, NULL, port_sender, &switch_ports[i]) != 0) {
+            fprintf(stderr, "Failed to create sender thread for port %d\n", i);
+            atomic_store(&shutting_down, true);
+            for (int j = 0; j < i; j++) {
+                pthread_mutex_lock(&switch_ports[j].queue_mutex);
+                pthread_cond_broadcast(&switch_ports[j].queue_cond);
+                pthread_mutex_unlock(&switch_ports[j].queue_mutex);
+                pthread_join(switch_ports[j].sender_thread, NULL);
+            }
+            pthread_join(timer_thread, NULL);
+            pthread_join(aging_thread, NULL);
+            log_message("Startup failed");
+            logger_stop();
+            close(server_fd);
+            unlink(SOCKET_PATH);
+            shm_stats_destroy(shared_stats, shm_fd);
+            mac_table_destroy();
+            return 1;
+        }
     }
 
     printf("Virtual Switch Control Plane Started\n");
@@ -891,11 +1313,26 @@ int main(int argc, char *argv[])
     unlink(SOCKET_PATH);
 
     for (int i = 0; i < running_ports; i++) {
+        pthread_mutex_lock(&switch_ports[i].queue_mutex);
+        pthread_cond_broadcast(&switch_ports[i].queue_cond);
+        pthread_mutex_unlock(&switch_ports[i].queue_mutex);
+        pthread_join(switch_ports[i].sender_thread, NULL);
+        for (int q = 0; q < 3; q++) {
+            queue_node_t *node = switch_ports[i].head[q];
+            while (node != NULL) { queue_node_t *next = node->next; frame_release(node->frame); free(node); node = next; }
+        }
+        pthread_cond_destroy(&switch_ports[i].queue_cond);
+        pthread_mutex_destroy(&switch_ports[i].token_mutex);
+        pthread_mutex_destroy(&switch_ports[i].queue_mutex);
         pthread_mutex_destroy(&switch_ports[i].mutex);
     }
 
     sem_destroy(&free_ports);
 
+    pthread_join(timer_thread, NULL);
+    pthread_join(aging_thread, NULL);
+    log_message("Switch stopped cleanly");
+    logger_stop();
     mac_table_destroy();
 
     shm_stats_destroy(shared_stats, shm_fd);

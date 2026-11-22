@@ -22,6 +22,6 @@ test_net_io: test_net_io.c net_io.c net_io.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) test_net_io.c net_io.c -o test_net_io $(LDFLAGS)
 
 clean:
-	rm -f switch swctl test test_net_io host mac_table_dump.txt
+	rm -f switch swctl test test_net_io host mac_table_dump.txt switch.log
 
 .PHONY: all clean
